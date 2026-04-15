@@ -1,120 +1,102 @@
 import asyncio
-import logging
-import sqlite3
-from datetime import datetime
-from aiogram import Bot, Dispatcher, types, F
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram.filters import Command
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.storage.memory import MemoryStorage
 import os
+import requests
+from bs4 import BeautifulSoup
+from aiogram import Bot
 
-TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
+# === CONFIG ===
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_ID = int(os.getenv("ADMIN_ID"))
 
-logging.basicConfig(level=logging.INFO)
-bot = Bot(token=TOKEN)
-storage = MemoryStorage()
-dp = Dispatcher(storage=storage)
+KEYWORDS = ["telegram бот", "python", "парсинг", "отзывы", "тексты"]
+MIN_PRICE = 500
+CHECK_INTERVAL = 600  # 10 минут
 
-def init_db():
-    conn = sqlite3.connect("orders.db")
-    c = conn.cursor()
-    c.execute("""CREATE TABLE IF NOT EXISTS orders
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  user_id INTEGER,
-                  username TEXT,
-                  product_link TEXT,
-                  review_text TEXT,
-                  status TEXT,
-                  created_at TEXT)""")
-    conn.commit()
-    conn.close()
+bot = Bot(token=BOT_TOKEN)
 
-init_db()
+sent_links = set()
 
-def save_order(user_id, username, product_link, review_text):
-    conn = sqlite3.connect("orders.db")
-    c = conn.cursor()
-    c.execute("INSERT INTO orders (user_id, username, product_link, review_text, status, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-              (user_id, username, product_link, review_text, "pending", datetime.now().isoformat()))
-    conn.commit()
-    conn.close()
 
-main_keyboard = InlineKeyboardMarkup(inline_keyboard=[
-    [InlineKeyboardButton(text="📝 Сделать заказ", callback_data="new_order")],
-    [InlineKeyboardButton(text="ℹ️ Как это работает", callback_data="info")],
-    [InlineKeyboardButton(text="📞 Поддержка", callback_data="support")]
-])
+# === PARSER ===
+def parse_kwork():
+    orders = []
 
-class OrderForm(StatesGroup):
-    waiting_for_product_link = State()
-    waiting_for_review_text = State()
+    for keyword in KEYWORDS:
+        try:
+            url = f"https://kwork.ru/projects?keyword={keyword}"
+            response = requests.get(url, timeout=10)
+            soup = BeautifulSoup(response.text, "html.parser")
 
-@dp.message(Command("start"))
-async def cmd_start(message: Message):
-    await message.answer(
-        "🤖 *Бот для заказа отзывов*\n\n💰 500₽ за 5 отзывов\n⏱ 2 часа\n\nНажми кнопку ниже",
-        reply_markup=main_keyboard,
-        parse_mode="Markdown"
-    )
+            cards = soup.find_all("div", class_="project-card")
 
-@dp.callback_query(F.data == "new_order")
-async def new_order(callback: CallbackQuery, state: FSMContext):
-    await callback.message.edit_text("📎 Отправь ссылку на товар (Ozon или WB)", parse_mode="Markdown")
-    await state.set_state(OrderForm.waiting_for_product_link)
-    await callback.answer()
+            for card in cards:
+                try:
+                    title_tag = card.find("a")
+                    if not title_tag:
+                        continue
 
-@dp.message(OrderForm.waiting_for_product_link)
-async def get_product_link(message: Message, state: FSMContext):
-    link = message.text
-    if "ozon" not in link.lower() and "wildberries" not in link.lower():
-        await message.answer("❌ Отправь ссылку на Ozon или Wildberries")
-        return
-    await state.update_data(product_link=link)
-    await message.answer("✍️ Напиши 3 ключевые фразы для отзывов", parse_mode="Markdown")
-    await state.set_state(OrderForm.waiting_for_review_text)
+                    title = title_tag.text.strip()
+                    link = "https://kwork.ru" + title_tag["href"]
 
-@dp.message(OrderForm.waiting_for_review_text)
-async def get_review_text(message: Message, state: FSMContext):
-    keywords = message.text
-    data = await state.get_data()
-    product_link = data.get("product_link")
-    
-    save_order(
-        user_id=message.from_user.id,
-        username=message.from_user.username or message.from_user.full_name,
-        product_link=product_link,
-        review_text=keywords
-    )
-    
-    if ADMIN_ID:
-        await bot.send_message(ADMIN_ID, f"🆕 Новый заказ!\n👤 @{message.from_user.username}\n🔗 {product_link}\n📝 {keywords}")
-    
-    await message.answer("✅ Заказ принят! Отзывы через 2 часа. 500₽ после получения.")
-    await state.clear()
+                    text = card.get_text()
+                    price = int(''.join(filter(str.isdigit, text)))
 
-@dp.callback_query(F.data == "info")
-async def show_info(callback: CallbackQuery):
-    await callback.message.edit_text("📖 1️⃣ Ссылка → 2️⃣ Ключи → 3️⃣ 5 отзывов → 4️⃣ 500₽", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_menu")]]))
-    await callback.answer()
+                    if price >= MIN_PRICE and link not in sent_links:
+                        orders.append((title, price, link))
+                        sent_links.add(link)
 
-@dp.callback_query(F.data == "support")
-async def show_support(callback: CallbackQuery):
-    await callback.message.edit_text("📞 Поддержка: @your_support", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_menu")]]))
-    await callback.answer()
+                except Exception:
+                    continue
 
-@dp.callback_query(F.data == "back_to_menu")
-async def back_to_menu(callback: CallbackQuery):
-    await callback.message.edit_text("Главное меню:", reply_markup=main_keyboard)
-    await callback.answer()
+        except Exception as e:
+            print("Ошибка парсинга:", e)
 
-async def on_startup():
-    logging.info("Бот запущен!")
+    return orders
+
+
+# === GENERATE REPLY ===
+def generate_reply(title):
+    return f"""Сделаю сегодня.
+
+Есть опыт в похожих задачах: {title}
+
+Готов быстро реализовать и показать результат.
+Могу начать сразу.
+"""
+
+
+# === SEND ORDERS ===
+async def send_orders():
+    orders = parse_kwork()
+
+    for title, price, link in orders:
+        message = f"""
+🔥 {title}
+
+💸 {price} ₽
+🔗 {link}
+
+📩 Отклик:
+{generate_reply(title)}
+"""
+        try:
+            await bot.send_message(ADMIN_ID, message)
+        except Exception as e:
+            print("Ошибка отправки:", e)
+
+
+# === MAIN LOOP ===
+async def main():
+    print("Бот запущен...")
+
+    while True:
+        try:
+            await send_orders()
+        except Exception as e:
+            print("Ошибка цикла:", e)
+
+        await asyncio.sleep(CHECK_INTERVAL)
+
 
 if __name__ == "__main__":
-    async def main():
-        await on_startup()
-        await dp.start_polling(bot)
     asyncio.run(main())
